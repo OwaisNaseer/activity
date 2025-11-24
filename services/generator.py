@@ -8,119 +8,121 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Try importing transformers for local GPT2
-try:
-    from transformers import GPT2LMHeadModel, GPT2Tokenizer, pipeline
-    import torch
-    TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    TRANSFORMERS_AVAILABLE = False
-    logging.error("transformers or torch not available - install with: pip install transformers torch")
+# Lazy import of openai to avoid import errors if package is not installed
+_openai = None
+
+def _get_openai():
+    """Lazy import of openai module"""
+    global _openai
+    if _openai is None:
+        try:
+            import openai
+            _openai = openai
+        except ImportError as e:
+            logger.error(f"Failed to import openai: {str(e)}")
+            raise ImportError("openai package is not installed. Please install it with: pip install openai")
+    return _openai
 
 class ActivityGenerator:
-    """Service for generating activities using GPT2 locally (downloaded model)"""
+    """Service for generating activities using OpenAI API"""
     
     def __init__(self):
-        # GPT2 from HuggingFace - downloaded locally
-        self.hf_token = os.getenv("HUGGINGFACE_API_TOKEN", "")
-        self.gpt2_model = "gpt2"
-        
-        # Local model and tokenizer
-        self.model = None
-        self.tokenizer = None
-        self.generator = None
-        self.model_loaded = False
-        
-        if not self.hf_token:
-            logger.error("HUGGINGFACE_API_TOKEN not found in environment variables!")
-        else:
-            logger.info(f"GPT2 Local - Token loaded: {self.hf_token[:10]}...")
-        
-        if not TRANSFORMERS_AVAILABLE:
-            logger.error("transformers library not available! Install with: pip install transformers torch")
-        else:
-            logger.info("transformers library available - will load GPT2 locally")
-    
-    def _load_gpt2_model(self):
-        """Load GPT2 model locally using your HuggingFace token"""
-        if self.model_loaded:
-            return True
-        
-        if not TRANSFORMERS_AVAILABLE:
-            logger.error("Cannot load GPT2 - transformers not available")
-            return False
-        
+        # Try to import openai
         try:
-            logger.info("Downloading GPT2 model from HuggingFace (this may take a few minutes on first run)...")
-            logger.info("Using your HuggingFace token for authentication...")
-            
-            # Load tokenizer with your token
-            self.tokenizer = GPT2Tokenizer.from_pretrained(
-                self.gpt2_model,
-                token=self.hf_token if self.hf_token else None
+            openai = _get_openai()
+        except ImportError as e:
+            logger.error(f"OpenAI import failed: {str(e)}")
+            self.api_key = None
+            self.model = None
+            self.temperature = None
+            self.base_url = None
+            self.client = None
+            return
+        
+        # OpenAI Configuration
+        self.api_key = os.getenv("OPENAI_API_KEY", "")
+        self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.3"))
+        self.base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        
+        if not self.api_key:
+            logger.error("OPENAI_API_KEY not found in environment variables!")
+        else:
+            logger.info(f"OpenAI API - Key loaded: {self.api_key[:10]}...")
+            logger.info(f"OpenAI Model: {self.model}")
+            logger.info(f"OpenAI Temperature: {self.temperature}")
+            logger.info(f"OpenAI Base URL: {self.base_url}")
+        
+        # Initialize OpenAI client
+        try:
+            self.client = openai.OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url
             )
-            logger.info("✓ Tokenizer loaded")
-            
-            # Load model with your token
-            self.model = GPT2LMHeadModel.from_pretrained(
-                self.gpt2_model,
-                token=self.hf_token if self.hf_token else None
-            )
-            logger.info("✓ Model loaded")
-            
-            # Set model to evaluation mode
-            self.model.eval()
-            
-            # Create text generation pipeline
-            self.generator = pipeline(
-                "text-generation",
-                model=self.model,
-                tokenizer=self.tokenizer,
-                device=-1  # Use CPU (change to 0 for GPU if available)
-            )
-            logger.info("✓ GPT2 pipeline created")
-            
-            self.model_loaded = True
-            logger.info("✓ GPT2 model fully loaded and ready!")
-            return True
-            
+            logger.info("✓ OpenAI client initialized")
         except Exception as e:
-            logger.error(f"Error loading GPT2 model: {str(e)}")
-            return False
+            logger.error(f"Error initializing OpenAI client: {str(e)}")
+            self.client = None
     
     def generate_activity(self, request_data: dict) -> tuple[bool, Optional[str], Optional[str]]:
         """
-        Generate activity description using GPT2 locally
+        Generate activity description using OpenAI API
         
         Returns:
             tuple: (success: bool, activity: str or None, error: str or None)
         """
         try:
-            # Load model if not already loaded
-            if not self.model_loaded:
-                logger.info("Loading GPT2 model...")
-                if not self._load_gpt2_model():
-                    return False, None, "Failed to load GPT2 model locally"
+            # Always ensure we have valid request_data
+            if not request_data:
+                request_data = {}
+            
+            # If OpenAI is not configured, return template response
+            if not self.api_key or not self.client:
+                logger.warning("OpenAI not configured, using template response")
+                return self._generate_template_response(request_data)
             
             # Build the prompt
-            prompt = self._build_prompt(request_data)
+            try:
+                prompt = self._build_prompt(request_data)
+            except Exception as prompt_error:
+                logger.error(f"Error building prompt: {str(prompt_error)}")
+                # Fall back to template
+                return self._generate_template_response(request_data)
             
-            logger.info("Generating activity using local GPT2...")
-            result = self._generate_with_gpt2(prompt)
-            
-            if result[0]:
-                logger.info("✓ Successfully generated activity using local GPT2!")
-                return result
-            else:
-                logger.error(f"GPT2 generation failed: {result[2]}")
+            # Try to generate with OpenAI
+            try:
+                logger.info("Generating activity using OpenAI API...")
+                logger.info(f"Generator state - API Key: {'Set' if self.api_key else 'Not set'}, Client: {'Initialized' if self.client else 'Not initialized'}")
+                
+                result = self._generate_with_openai(prompt)
+                
+                if result and len(result) >= 3 and result[0] and result[1]:
+                    logger.info("✓ Successfully generated activity using OpenAI!")
+                    return result
+                else:
+                    error_detail = result[2] if result and len(result) > 2 else 'Unknown error'
+                    logger.warning(f"OpenAI generation failed, using template. Error: {error_detail}")
+                    # Log the error but still return template
+                    logger.warning("Falling back to template response due to OpenAI failure")
+                    return self._generate_template_response(request_data)
+            except Exception as openai_error:
+                logger.error(f"OpenAI API exception: {type(openai_error).__name__}: {str(openai_error)}", exc_info=True)
+                # Fall back to template
+                logger.warning("Falling back to template response due to exception")
                 return self._generate_template_response(request_data)
             
         except Exception as e:
-            logger.error(f"Error generating activity: {str(e)}")
-            return False, None, f"Error generating activity: {str(e)}"
+            logger.error(f"Error generating activity: {str(e)}", exc_info=True)
+            # Always return template as fallback
+            try:
+                return self._generate_template_response(request_data)
+            except Exception as template_error:
+                logger.error(f"Even template generation failed: {str(template_error)}")
+                # Last resort - return a basic error
+                return False, None, f"Error generating activity: {str(e)}"
     
     def _build_prompt(self, data: dict) -> str:
-        """Build a detailed prompt for GPT2"""
+        """Build a detailed prompt for OpenAI to generate lesson plan"""
         subject = data.get("subject", "N/A")
         grade_band = data.get("grade_band", "N/A")
         topic = data.get("topic_concept", "N/A")
@@ -143,10 +145,7 @@ class ActivityGenerator:
         }
         lang_instruction = language_instructions.get(language, f"in {language}")
 
-        # Calculate main activity time (ensure it's at least 5 minutes)
-        main_activity_time = max(5, available_time - 10) if available_time > 10 else max(1, available_time - 5)
-
-        prompt = f"""You are an expert instructional designer. Generate a professional educational activity description.
+        prompt = f"""You are an expert instructional designer. Generate a comprehensive, professional lesson plan in the EXACT format specified below.
 
 IMPORTANT: Write the ENTIRE response {lang_instruction}. All content must be in {language}.
 
@@ -158,139 +157,191 @@ Constraints: {constraints}
 Available Time: {available_time} minutes
 Output Language: {language} (MUST write in {language})
 
-Generate a detailed educational activity description. Use the EXACT materials specified: {materials}. Consider these constraints: {constraints}.
+Generate a detailed lesson plan following this EXACT structure and format. Write everything {lang_instruction}:
 
-Return ONLY the activity in this EXACT format (write everything {lang_instruction}):
+# [Lesson Title: {topic}]
 
-# Educational Activity: {topic}
+## LEARNING OBJECTIVE
+[Write a clear, measurable learning objective. Students will...]
 
-## Subject: {subject}
-## Grade/Band: {grade_band}
-## Duration: {available_time} minutes
+## ASSESSMENT
+[Describe how students will demonstrate mastery. Include: working prototype/demonstration, written explanation, rubric-based assessment covering reliability, component interaction, and justification of choices/safety considerations.]
 
-### Learning Objectives:
-- [Write 3-5 clear, measurable learning objectives in {language}]
+## KEY POINTS
+- [Core concept 1: e.g., Fundamentals related to the topic]
+- [Core concept 2: e.g., Practical application and hands-on learning]
+- [Core concept 3: e.g., Design process and documentation]
+- [Core concept 4: e.g., Safety and classroom management]
+- [Core concept 5: Add more as appropriate for the topic]
 
-### Materials Needed:
-- [List all materials. MUST use: {materials}]
+## OPENING
+- **Hook (1-2 minutes)**: [Brief video/demo or engaging introduction]
+- **Goal Explanation**: [Explain the lesson's goal and what students will accomplish]
+- **Group Organization**: [Organize students into groups of 3-4 with assigned roles: project manager, builder, programmer, tester/documenter]
+- **Anticipatory Question**: [Pose a question to engage students]
 
-### Activity Steps:
-1. **Introduction (5 minutes)**: [Describe how to introduce the topic in {language}]
-2. **Main Activity ({main_activity_time} minutes)**: [Provide detailed step-by-step instructions in {language}]
-3. **Wrap-up (5 minutes)**: [Describe how to review and assess in {language}]
+## INTRODUCTION TO NEW MATERIAL
+[5-8 minutes per mini-topic]
+- **Key Concepts**: [Explain main concepts related to {topic}]
+- **Materials Overview**: [Explain how to use: {materials}]
+- **Basic Principles**: [Explain fundamental principles]
+- **Active Learning**: [Include hands-on activity or demonstration]
+- **Common Misconception**: [Address a common misconception about the topic]
 
-### Constraints Considered:
-{constraints}
+## GUIDED PRACTICE
+- **Behavioral Expectations**: [Set clear expectations for student behavior]
+- **Component Identification (5 minutes)**: [Activity to identify key elements]
+- **Simple Activity Build (10 minutes)**: [Step-by-step activity building]
+- **Practice Exercise (10-15 minutes)**: [Guided practice with teacher support and guiding questions]
+- **Task Challenge Introduction (10 minutes)**: [Introduce the main challenge with success criteria and model timeline]
+- **Monitoring**: [Use checklist and probing questions to monitor student performance]
 
-### Assessment:
-- [List 2-4 assessment methods in {language}]
+## INDEPENDENT PRACTICE
+- **Behavioral Expectations**: [Set expectations for collaborative work]
+- **Assignment**: [Teams design and complete the main activity]
+- **Deliverables**: 
+  - Working prototype or completed work
+  - One-page design explanation
+  - Team demonstration
+- **Timeline**: [Adapt for {available_time} minute lesson or split across two class periods]
+- **Teacher Support**: [Mini-lessons and rubric for formative feedback]
 
-REMEMBER: Write EVERYTHING in {language}. Start now:"""
+## CLOSING
+- **Exit Activity**: [Quick activity where teams share success/challenge]
+- **Restatement**: [Restate learning objective and assessment criteria]
+
+## EXTENSION ACTIVITY
+[For early finishers: Add a secondary objective or challenge with documentation and testing]
+
+## HOMEWORK
+[Individual reflection/journal on activity behavior, technical challenges, and potential improvements with additional resources]
+
+## STANDARDS ALIGNED
+- **Relevant Standards**: [List applicable educational standards for {subject} at {grade_band} level]
+- **Note**: [Adapt materials and recommendations as needed based on: {constraints}]
+
+REMEMBER: Write EVERYTHING in {language}. Use the EXACT materials specified: {materials}. Consider these constraints: {constraints}. Make it appropriate for {grade_band} grade level and {available_time} minutes duration."""
         return prompt
     
-    def _generate_with_gpt2(self, prompt: str) -> tuple[bool, Optional[str], Optional[str]]:
-        """Generate text using local GPT2 model"""
+    def _generate_with_openai(self, prompt: str) -> tuple[bool, Optional[str], Optional[str]]:
+        """Generate text using OpenAI API"""
         try:
-            if not self.generator:
-                return False, None, "GPT2 generator not initialized"
+            # Check if client is available
+            if not self.client:
+                error_msg = "OpenAI client is not initialized"
+                logger.error(error_msg)
+                return False, None, error_msg
             
-            logger.info("Running GPT2 inference locally...")
+            # Check if API key is set
+            if not self.api_key:
+                error_msg = "OPENAI_API_KEY is not configured"
+                logger.error(error_msg)
+                return False, None, error_msg
             
-            # Calculate max length (cap at 1024 tokens for GPT2)
-            prompt_tokens = len(prompt.split())
-            max_length = min(prompt_tokens + 600, 1024)
+            logger.info(f"Calling OpenAI API with model: {self.model}, base_url: {self.base_url}")
+            logger.info(f"API Key present: {bool(self.api_key)}, Key prefix: {self.api_key[:10] if self.api_key else 'N/A'}...")
             
-            # Generate text with GPT2 - improved parameters
-            results = self.generator(
-                prompt,
-                max_length=max_length,
-                max_new_tokens=600,
-                temperature=0.8,  # Slightly higher for more creativity
-                do_sample=True,
-                top_p=0.95,
-                top_k=50,
-                repetition_penalty=1.3,  # Higher to reduce repetition
-                num_return_sequences=1,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert instructional designer who creates comprehensive, well-structured lesson plans for educators."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=self.temperature,
+                max_tokens=4000
             )
             
-            if results and len(results) > 0:
-                generated_text = results[0].get("generated_text", "")
+            logger.info(f"OpenAI API response received: {type(response)}")
+            
+            if response and response.choices and len(response.choices) > 0:
+                generated_text = response.choices[0].message.content.strip()
                 
-                # Extract only the new generated part (remove the prompt)
-                if generated_text.startswith(prompt):
-                    generated_text = generated_text[len(prompt):].strip()
-                
-                # Clean up the generated text
-                generated_text = self._clean_generated_text(generated_text)
-                
-                if generated_text and generated_text.strip():
+                if generated_text:
                     logger.info(f"✓ Generated {len(generated_text)} characters")
-                    return True, generated_text.strip(), None
+                    return True, generated_text, None
                 else:
-                    return False, None, "GPT2 generated empty text"
+                    error_msg = "OpenAI returned empty text"
+                    logger.warning(error_msg)
+                    return False, None, error_msg
             else:
-                return False, None, "GPT2 returned no results"
+                error_msg = "OpenAI returned no results (empty choices)"
+                logger.warning(error_msg)
+                return False, None, error_msg
                 
         except Exception as e:
-            logger.error(f"Error generating with GPT2: {str(e)}")
-            return False, None, f"GPT2 generation error: {str(e)}"
-    
-    def _clean_generated_text(self, text: str) -> str:
-        """Clean and format the generated text"""
-        if not text:
-            return text
-        
-        # Remove any incomplete sentences at the end
-        lines = text.split('\n')
-        cleaned_lines = []
-        
-        for line in lines:
-            line = line.strip()
-            if line:
-                # Remove lines that are just dashes or incomplete
-                if not (line.startswith('-') and len(line) <= 3):
-                    cleaned_lines.append(line)
-        
-        # Join lines and clean up extra whitespace
-        cleaned = '\n'.join(cleaned_lines)
-        
-        # Remove multiple consecutive newlines
-        while '\n\n\n' in cleaned:
-            cleaned = cleaned.replace('\n\n\n', '\n\n')
-        
-        return cleaned.strip()
+            # Log detailed error information
+            error_type = type(e).__name__
+            error_msg = str(e)
+            logger.error(f"OpenAI API Error - Type: {error_type}, Message: {error_msg}")
+            logger.error(f"Full error details: {repr(e)}")
+            
+            # Provide more specific error messages based on error type
+            if "authentication" in error_msg.lower() or "api key" in error_msg.lower() or "401" in error_msg:
+                detailed_error = f"OpenAI API authentication failed. Please check your API key. Error: {error_msg}"
+            elif "rate limit" in error_msg.lower() or "429" in error_msg:
+                detailed_error = f"OpenAI API rate limit exceeded. Please try again later. Error: {error_msg}"
+            elif "model" in error_msg.lower() or "404" in error_msg:
+                detailed_error = f"OpenAI model not found. Check if model '{self.model}' is available. Error: {error_msg}"
+            elif "network" in error_msg.lower() or "connection" in error_msg.lower():
+                detailed_error = f"Network error connecting to OpenAI API. Check your internet connection and base_url. Error: {error_msg}"
+            else:
+                detailed_error = f"OpenAI API error ({error_type}): {error_msg}"
+            
+            logger.error(detailed_error)
+            return False, None, detailed_error
     
     def _generate_template_response(self, data: dict) -> tuple[bool, Optional[str], Optional[str]]:
-        """Generate a template-based response when GPT2 fails"""
-        activity = f"""# Educational Activity: {data.get('topic_concept', 'Activity')}
+        """Generate a template-based response when OpenAI fails"""
+        activity = f"""# {data.get('topic_concept', 'Lesson Plan')}
 
-## Subject: {data.get('subject', 'General')}
-## Grade/Band: {data.get('grade_band', 'All Levels')}
-## Duration: {data.get('available_time', 0)} minutes
+## LEARNING OBJECTIVE
+Students will understand the key concepts of {data.get('topic_concept', 'the topic')} and apply their knowledge through hands-on activities.
 
-### Learning Objectives:
-- Students will understand the key concepts of {data.get('topic_concept', 'the topic')}
-- Students will apply their knowledge through hands-on activities
-- Students will demonstrate comprehension through assessment
+## ASSESSMENT
+Students will demonstrate mastery through:
+- Working prototype or demonstration
+- Written explanation of their work
+- Rubric-based assessment covering reliability, component interaction, and justification of choices
 
-### Materials Needed:
-{data.get('available_materials', 'Standard classroom materials')}
+## KEY POINTS
+- Core concepts related to {data.get('topic_concept', 'the topic')}
+- Practical application and hands-on learning
+- Design process and documentation
+- Safety considerations
 
-### Activity Steps:
-1. **Introduction (5 minutes)**: Introduce the topic and learning objectives
-2. **Main Activity ({data.get('available_time', 30) - 10} minutes)**: Engage students in the core learning activity
-3. **Wrap-up (5 minutes)**: Review key concepts and assess understanding
+## OPENING
+- **Hook (1-2 minutes)**: Brief introduction to engage students
+- **Goal Explanation**: Explain what students will accomplish
+- **Group Organization**: Organize students into groups with assigned roles
+- **Anticipatory Question**: Pose an engaging question
 
-### Constraints Considered:
-{data.get('constraints', 'None specified')}
+## INTRODUCTION TO NEW MATERIAL
+Introduce key concepts and materials needed for the activity.
 
-### Assessment:
-- Observe student participation and engagement
-- Review completed work or responses
-- Conduct a brief formative assessment
+## GUIDED PRACTICE
+Scaffolded activities with teacher facilitation and support.
 
-*Note: This is a template-based response generated locally because GPT2 generation failed.*"""
+## INDEPENDENT PRACTICE
+Students work in teams to complete the main activity.
+
+## CLOSING
+Review key concepts and assess understanding.
+
+## EXTENSION ACTIVITY
+Additional challenges for early finishers.
+
+## HOMEWORK
+Reflection and journaling on the activity.
+
+## STANDARDS ALIGNED
+Relevant educational standards for this lesson.
+
+*Note: This is a template-based response generated because OpenAI API call failed.*"""
         
         return True, activity, None
