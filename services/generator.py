@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Optional
+from typing import Optional, List, Union
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -64,22 +64,28 @@ class ActivityGenerator:
             logger.error(f"Error initializing OpenAI client: {str(e)}")
             self.client = None
     
-    def generate_activity(self, request_data: dict) -> tuple[bool, Optional[str], Optional[str]]:
+    def generate_activity(self, request_data: dict) -> tuple[bool, Union[Optional[str], Optional[List[str]]], Optional[str]]:
         """
         Generate activity description using OpenAI API
         
         Returns:
-            tuple: (success: bool, activity: str or None, error: str or None)
+            tuple: (success: bool, activity/activities: str or List[str] or None, error: str or None)
+            - For num_variants=1: returns (bool, str, str)
+            - For num_variants>1: returns (bool, List[str], str)
         """
         try:
             # Always ensure we have valid request_data
             if not request_data:
                 request_data = {}
             
+            num_variants = request_data.get("num_variants", 1)
+            if num_variants < 1 or num_variants > 3:
+                num_variants = 1
+            
             # If OpenAI is not configured, return template response
             if not self.api_key or not self.client:
                 logger.warning("OpenAI not configured, using template response")
-                return self._generate_template_response(request_data)
+                return self._generate_template_response(request_data, num_variants)
             
             # Build the prompt
             try:
@@ -87,35 +93,67 @@ class ActivityGenerator:
             except Exception as prompt_error:
                 logger.error(f"Error building prompt: {str(prompt_error)}")
                 # Fall back to template
-                return self._generate_template_response(request_data)
+                return self._generate_template_response(request_data, num_variants)
             
             # Try to generate with OpenAI
             try:
-                logger.info("Generating activity using OpenAI API...")
+                logger.info(f"Generating {num_variants} variant(s) using OpenAI API...")
                 logger.info(f"Generator state - API Key: {'Set' if self.api_key else 'Not set'}, Client: {'Initialized' if self.client else 'Not initialized'}")
                 
-                result = self._generate_with_openai(prompt)
-                
-                if result and len(result) >= 3 and result[0] and result[1]:
-                    logger.info("✓ Successfully generated activity using OpenAI!")
-                    return result
+                if num_variants == 1:
+                    # Single variant - backward compatible
+                    result = self._generate_with_openai(prompt)
+                    
+                    if result and len(result) >= 3 and result[0] and result[1]:
+                        logger.info("✓ Successfully generated activity using OpenAI!")
+                        return result
+                    else:
+                        error_detail = result[2] if result and len(result) > 2 else 'Unknown error'
+                        logger.warning(f"OpenAI generation failed, using template. Error: {error_detail}")
+                        return self._generate_template_response(request_data, num_variants)
                 else:
-                    error_detail = result[2] if result and len(result) > 2 else 'Unknown error'
-                    logger.warning(f"OpenAI generation failed, using template. Error: {error_detail}")
-                    # Log the error but still return template
-                    logger.warning("Falling back to template response due to OpenAI failure")
-                    return self._generate_template_response(request_data)
+                    # Multiple variants
+                    variants = []
+                    errors = []
+                    
+                    for variant_idx in range(num_variants):
+                        # Use slight temperature variation for each variant
+                        temp_variation = self.temperature + (variant_idx * 0.1)
+                        logger.info(f"Generating variant {variant_idx + 1}/{num_variants} with temperature {temp_variation:.2f}")
+                        
+                        result = self._generate_with_openai(prompt, temperature=temp_variation)
+                        
+                        if result and len(result) >= 3 and result[0] and result[1]:
+                            variants.append(result[1])
+                            logger.info(f"✓ Successfully generated variant {variant_idx + 1}")
+                        else:
+                            error_detail = result[2] if result and len(result) > 2 else 'Unknown error'
+                            errors.append(f"Variant {variant_idx + 1}: {error_detail}")
+                            logger.warning(f"Failed to generate variant {variant_idx + 1}: {error_detail}")
+                    
+                    if variants:
+                        if len(variants) == num_variants:
+                            logger.info(f"✓ Successfully generated all {num_variants} variants!")
+                            return True, variants, None
+                        else:
+                            logger.warning(f"Generated {len(variants)}/{num_variants} variants. Errors: {errors}")
+                            return True, variants, f"Generated {len(variants)}/{num_variants} variants. Some failed: {'; '.join(errors)}"
+                    else:
+                        logger.warning("All variants failed, using template response")
+                        return self._generate_template_response(request_data, num_variants)
+                        
             except Exception as openai_error:
                 logger.error(f"OpenAI API exception: {type(openai_error).__name__}: {str(openai_error)}", exc_info=True)
                 # Fall back to template
                 logger.warning("Falling back to template response due to exception")
-                return self._generate_template_response(request_data)
+                return self._generate_template_response(request_data, num_variants)
             
         except Exception as e:
             logger.error(f"Error generating activity: {str(e)}", exc_info=True)
             # Always return template as fallback
             try:
-                return self._generate_template_response(request_data)
+                num_variants = request_data.get("num_variants", 1) if request_data else 1
+                return self._generate_template_response(request_data, num_variants)
             except Exception as template_error:
                 logger.error(f"Even template generation failed: {str(template_error)}")
                 # Last resort - return a basic error
@@ -130,6 +168,13 @@ class ActivityGenerator:
         constraints = data.get("constraints", "None specified")
         available_time = data.get("available_time", 0)
         language = data.get("output_language", "English")
+        standard = data.get("standard", None)
+        
+        # Handle "Other" language option
+        if language == "Other":
+            language = data.get("language", "English")
+            if not language or language.strip() == "":
+                language = "English"
         
         # Map language names to language instructions
         language_instructions = {
@@ -141,13 +186,25 @@ class ActivityGenerator:
             "Portuguese": "in Portuguese (em português)",
             "Chinese": "in Chinese (用中文)",
             "Japanese": "in Japanese (日本語で)",
-            "Other": "in the requested language"
         }
-        lang_instruction = language_instructions.get(language, f"in {language}")
+        
+        # Check if language is recognized
+        lang_instruction = language_instructions.get(language, None)
+        if lang_instruction is None:
+            # Language not recognized - use English and add note
+            lang_instruction = "in English"
+            language_note = f"\n\nIMPORTANT NOTE: The requested language '{language}' may not be recognized or supported. The response will be generated in English. If you need content in a different language, please specify a recognized language name."
+        else:
+            language_note = ""
+        
+        # Build standard instruction
+        standard_instruction = ""
+        if standard and standard.strip():
+            standard_instruction = f"\n\nIMPORTANT: If the provided standard '{standard}' is not valid or not recognized, mention this professionally in the STANDARDS ALIGNED section as: 'Note: The provided standard may not be recognized or validated. Please adapt materials and recommendations as needed based on the constraints and available resources.'"
 
         prompt = f"""You are an expert instructional designer. Generate a comprehensive, professional lesson plan in the EXACT format specified below.
 
-IMPORTANT: Write the ENTIRE response {lang_instruction}. All content must be in {language}.
+IMPORTANT: Write the ENTIRE response {lang_instruction}. All content must be in {language}.{language_note}{standard_instruction}
 
 Subject: {subject}
 Grade/Band: {grade_band}
@@ -155,7 +212,12 @@ Topic/Concept: {topic}
 Available Materials: {materials}
 Constraints: {constraints}
 Available Time: {available_time} minutes
-Output Language: {language} (MUST write in {language})
+Output Language: {language} (MUST write in {language})"""
+        
+        if standard and standard.strip():
+            prompt += f"\nEducational Standard: {standard}"
+
+        prompt += f"""
 
 Generate a detailed lesson plan following this EXACT structure and format. Write everything {lang_instruction}:
 
@@ -216,15 +278,27 @@ Generate a detailed lesson plan following this EXACT structure and format. Write
 ## HOMEWORK
 [Individual reflection/journal on activity behavior, technical challenges, and potential improvements with additional resources]
 
-## STANDARDS ALIGNED
-- **Relevant Standards**: [List applicable educational standards for {subject} at {grade_band} level]
+## STANDARDS ALIGNED"""
+        
+        # Add standard alignment note if standard is provided
+        standard_align_text = ""
+        if standard and standard.strip():
+            standard_align_text = f" that align with: {standard}"
+        
+        prompt += f"""
+- **Relevant Standards**: [List applicable educational standards for {subject} at {grade_band} level{standard_align_text}]
 - **Note**: [Adapt materials and recommendations as needed based on: {constraints}]
 
 REMEMBER: Write EVERYTHING in {language}. Use the EXACT materials specified: {materials}. Consider these constraints: {constraints}. Make it appropriate for {grade_band} grade level and {available_time} minutes duration."""
         return prompt
     
-    def _generate_with_openai(self, prompt: str) -> tuple[bool, Optional[str], Optional[str]]:
-        """Generate text using OpenAI API"""
+    def _generate_with_openai(self, prompt: str, temperature: Optional[float] = None) -> tuple[bool, Optional[str], Optional[str]]:
+        """Generate text using OpenAI API
+        
+        Args:
+            prompt: The prompt to send to OpenAI
+            temperature: Optional temperature override (defaults to self.temperature)
+        """
         try:
             # Check if client is available
             if not self.client:
@@ -238,7 +312,10 @@ REMEMBER: Write EVERYTHING in {language}. Use the EXACT materials specified: {ma
                 logger.error(error_msg)
                 return False, None, error_msg
             
-            logger.info(f"Calling OpenAI API with model: {self.model}, base_url: {self.base_url}")
+            # Use provided temperature or default
+            use_temperature = temperature if temperature is not None else self.temperature
+            
+            logger.info(f"Calling OpenAI API with model: {self.model}, temperature: {use_temperature}, base_url: {self.base_url}")
             logger.info(f"API Key present: {bool(self.api_key)}, Key prefix: {self.api_key[:10] if self.api_key else 'N/A'}...")
             
             response = self.client.chat.completions.create(
@@ -253,7 +330,7 @@ REMEMBER: Write EVERYTHING in {language}. Use the EXACT materials specified: {ma
                         "content": prompt
                     }
                 ],
-                temperature=self.temperature,
+                temperature=use_temperature,
                 max_tokens=4000
             )
             
@@ -296,12 +373,26 @@ REMEMBER: Write EVERYTHING in {language}. Use the EXACT materials specified: {ma
             logger.error(detailed_error)
             return False, None, detailed_error
     
-    def _generate_template_response(self, data: dict) -> tuple[bool, Optional[str], Optional[str]]:
-        """Generate a template-based response when OpenAI fails"""
-        activity = f"""# {data.get('topic_concept', 'Lesson Plan')}
+    def _generate_template_response(self, data: dict, num_variants: int = 1) -> tuple[bool, Union[Optional[str], Optional[List[str]]], Optional[str]]:
+        """Generate a template-based response when OpenAI fails
+        
+        Returns:
+            For num_variants=1: (bool, str, str)
+            For num_variants>1: (bool, List[str], str)
+        """
+        standard = data.get("standard", None)
+        subject = data.get("subject", "the subject")
+        grade_band = data.get("grade_band", "the grade level")
+        topic = data.get("topic_concept", "the topic")
+        
+        standard_note = ""
+        if standard and standard.strip():
+            standard_note = f"\n- **Note**: The provided standard '{standard}' may not be recognized or validated. Please adapt materials and recommendations as needed."
+        
+        base_activity = f"""# {topic}
 
 ## LEARNING OBJECTIVE
-Students will understand the key concepts of {data.get('topic_concept', 'the topic')} and apply their knowledge through hands-on activities.
+Students will understand the key concepts of {topic} and apply their knowledge through hands-on activities.
 
 ## ASSESSMENT
 Students will demonstrate mastery through:
@@ -310,7 +401,7 @@ Students will demonstrate mastery through:
 - Rubric-based assessment covering reliability, component interaction, and justification of choices
 
 ## KEY POINTS
-- Core concepts related to {data.get('topic_concept', 'the topic')}
+- Core concepts related to {topic}
 - Practical application and hands-on learning
 - Design process and documentation
 - Safety considerations
@@ -340,8 +431,19 @@ Additional challenges for early finishers.
 Reflection and journaling on the activity.
 
 ## STANDARDS ALIGNED
-Relevant educational standards for this lesson.
+- **Relevant Standards**: [List applicable educational standards for {subject} at {grade_band} level]{standard_note}
 
 *Note: This is a template-based response generated because OpenAI API call failed.*"""
         
-        return True, activity, None
+        if num_variants == 1:
+            return True, base_activity, None
+        else:
+            # Generate multiple template variants with slight variations
+            variants = []
+            for i in range(num_variants):
+                variant = base_activity.replace(
+                    "Lesson Plan",
+                    f"Lesson Plan (Variant {i + 1})"
+                )
+                variants.append(variant)
+            return True, variants, None

@@ -85,6 +85,10 @@ async def generate_activity(request: ActivityRequest):
         logger.info(f"  Output Language: {request.output_language}")
         logger.info(f"  Materials: {request.available_materials or 'Not specified'}")
         logger.info(f"  Constraints: {request.constraints or 'None specified'}")
+        logger.info(f"  Standard: {request.standard or 'Not specified'}")
+        logger.info(f"  Language (Other): {request.language or 'N/A'}")
+        logger.info(f"  Number of Variants: {request.num_variants}")
+        logger.info(f"  Regenerate: {request.regenerate}")
         logger.info("=" * 60)
         
         # Validate input
@@ -112,66 +116,104 @@ async def generate_activity(request: ActivityRequest):
             "available_materials": request.available_materials or "",
             "constraints": request.constraints or "",
             "available_time": request.available_time,
-            "output_language": request.output_language
+            "output_language": request.output_language,
+            "standard": request.standard or "",
+            "regenerate": request.regenerate or False,
+            "language": request.language or "",
+            "num_variants": request.num_variants or 1
         }
         
         # Generate activity - FastAPI can handle sync functions in async endpoints
+        num_variants = request.num_variants or 1
         try:
             logger.info("Calling generator.generate_activity...")
             logger.info(f"Generator state check - API Key configured: {hasattr(generator, 'api_key') and generator.api_key is not None}")
             logger.info(f"Generator state check - Client initialized: {hasattr(generator, 'client') and generator.client is not None}")
             
-            success, activity, error = generator.generate_activity(request_data)
+            success, result, error = generator.generate_activity(request_data)
             
-            logger.info(f"Generator returned: success={success}, activity_length={len(activity) if activity else 0}, error={error}")
+            # Handle both single activity (str) and multiple activities (list)
+            if isinstance(result, list):
+                logger.info(f"Generator returned: success={success}, num_variants={len(result)}, error={error}")
+            else:
+                logger.info(f"Generator returned: success={success}, activity_length={len(result) if result else 0}, error={error}")
             
             # If generation failed, log the error for debugging
             if not success and error:
                 logger.error(f"Generation failed with error: {error}")
                 # Include the error in the response so frontend can show it
                 # But still return the template activity if available
-                if activity:
+                if result:
                     logger.info("Template activity was generated, returning it with error message")
         except Exception as gen_error:
             logger.error(f"Exception during generation: {str(gen_error)}", exc_info=True)
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
-            success, activity, error = False, None, f"Generation error: {str(gen_error)}"
+            success, result, error = False, None, f"Generation error: {str(gen_error)}"
         
         # Return response - ensure all fields are properly set
         try:
-            if success and activity:
-                logger.info(f"Activity generated successfully ({len(activity)} characters)")
-                # Ensure activity is a string and not None
-                activity_str = str(activity) if activity else ""
-                if not activity_str:
-                    # If activity is empty, treat as failure
+            if success and result:
+                # Check if result is a list (multiple variants) or string (single variant)
+                if isinstance(result, list):
+                    # Multiple variants
+                    logger.info(f"Activities generated successfully ({len(result)} variants)")
+                    if not result or len(result) == 0:
+                        return ActivityResponse(
+                            success=False,
+                            activity=None,
+                            activities=None,
+                            error="Generated activities array is empty"
+                        )
                     return ActivityResponse(
-                        success=False,
-                        activity=None,
-                        error="Generated activity is empty"
+                        success=True,
+                        activity=None,  # Set to None for multiple variants
+                        activities=result,
+                        error=None
                     )
-                return ActivityResponse(
-                    success=True,
-                    activity=activity_str,
-                    error=None
-                )
+                else:
+                    # Single variant (backward compatible)
+                    logger.info(f"Activity generated successfully ({len(result)} characters)")
+                    activity_str = str(result) if result else ""
+                    if not activity_str:
+                        return ActivityResponse(
+                            success=False,
+                            activity=None,
+                            activities=None,
+                            error="Generated activity is empty"
+                        )
+                    return ActivityResponse(
+                        success=True,
+                        activity=activity_str,
+                        activities=None,  # Set to None for single variant
+                        error=None
+                    )
             else:
                 error_msg = str(error) if error else "Failed to generate activity"
                 logger.error(f"Failed to generate activity: {error_msg}")
                 
                 # If we have a template activity but generation failed, return it with the error
-                if activity:
+                if result:
                     logger.info("Returning template activity with error message for user awareness")
-                    return ActivityResponse(
-                        success=True,  # Still return success since we have content
-                        activity=str(activity),
-                        error=f"Note: {error_msg}"  # Include error as a note
-                    )
+                    if isinstance(result, list):
+                        return ActivityResponse(
+                            success=True,
+                            activity=None,
+                            activities=result,
+                            error=f"Note: {error_msg}"
+                        )
+                    else:
+                        return ActivityResponse(
+                            success=True,
+                            activity=str(result),
+                            activities=None,
+                            error=f"Note: {error_msg}"
+                        )
                 else:
                     return ActivityResponse(
                         success=False,
                         activity=None,
+                        activities=None,
                         error=error_msg
                     )
         except Exception as resp_error:

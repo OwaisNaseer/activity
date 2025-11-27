@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 
 class ActivityRequest(BaseModel):
     """Request model for activity generation"""
@@ -10,10 +10,15 @@ class ActivityRequest(BaseModel):
     constraints: Optional[str] = Field(None, description="Constraints or limitations")
     available_time: int = Field(..., description="Available time in minutes", gt=0)
     output_language: str = Field(..., description="Output language for the activity")
+    standard: Optional[str] = Field(None, description="Educational standard")
+    regenerate: Optional[bool] = Field(False, description="Whether this is a regeneration request")
+    language: Optional[str] = Field(None, description="Language for 'Other' option")
+    num_variants: int = Field(1, description="Number of variants to generate (1-3)", ge=1, le=3)
 
 class ActivityResponse(BaseModel):
     """Response model for generated activity"""
     success: bool
-    activity: Optional[str] = None
+    activity: Optional[str] = None  # For backward compatibility (single variant)
+    activities: Optional[List[str]] = None  # For multiple variants
     error: Optional[str] = None
 
