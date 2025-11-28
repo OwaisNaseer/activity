@@ -562,6 +562,8 @@ async def generate_activity_stream(request: ActivityRequest):
                 if variant_idx > 0:
                     yield f"data: {json.dumps({'type': 'variant_separator', 'variant': variant_idx + 1, 'index': variant_idx, 'total': num_variants})}\n\n"
                 
+                # Show thinking/processing status before content starts
+                yield f"data: {json.dumps({'type': 'status', 'content': 'Thinking...', 'variant': variant_idx + 1})}\n\n"
                 yield f"data: {json.dumps({'type': 'status', 'content': f'Generating variant {variant_idx + 1} of {num_variants}...', 'variant': variant_idx + 1})}\n\n"
                 
                 # Use temperature variation for each variant (like old code)
@@ -572,10 +574,36 @@ async def generate_activity_stream(request: ActivityRequest):
                 
                 # Build markdown output prompt (same structure as old code)
                 from services.prompt_builder import build_toon_prompt
-                # Get language instruction
+                # Define recognized languages (same as prompt_builder)
+                RECOGNIZED_LANGUAGES = {
+                    "English", "Spanish", "French", "German", "Italian", "Portuguese",
+                    "Chinese", "Japanese", "Korean", "Russian", "Arabic", "Hindi",
+                    "Dutch", "Swedish", "Norwegian", "Danish", "Finnish", "Polish",
+                    "Turkish", "Greek", "Hebrew", "Thai", "Vietnamese", "Indonesian",
+                    "Czech", "Romanian", "Hungarian", "Bulgarian", "Croatian", "Serbian"
+                }
+                
+                # Get language instruction - handle "Other" with validation
                 language = request.output_language
+                original_language = language
                 if language == "Other":
-                    language = request.language or "English"
+                    custom_language = request.language or "English"
+                    if not custom_language or custom_language.strip() == "":
+                        language = "English"
+                        logger.warning("Custom language was empty, defaulting to English")
+                    else:
+                        custom_language = custom_language.strip()
+                        # Check if custom language is recognized
+                        if custom_language not in RECOGNIZED_LANGUAGES:
+                            logger.warning(
+                                f"Custom language '{custom_language}' is not recognized. "
+                                f"Falling back to English for reliable generation."
+                            )
+                            language = "English"
+                        else:
+                            language = custom_language
+                
+                # Map known languages to instructions
                 lang_instructions = {
                     "English": "in English",
                     "Spanish": "in Spanish (en español)",
@@ -586,7 +614,18 @@ async def generate_activity_stream(request: ActivityRequest):
                     "Chinese": "in Chinese (用中文)",
                     "Japanese": "in Japanese (日本語で)",
                 }
-                lang_instruction = lang_instructions.get(language, "in English")
+                
+                # If language is in the map, use the instruction; otherwise fall back to English
+                if language in lang_instructions:
+                    lang_instruction = lang_instructions[language]
+                else:
+                    # Language not recognized - fall back to English for safety
+                    logger.warning(
+                        f"Language '{language}' not in instruction map. "
+                        f"Falling back to English for reliable generation."
+                    )
+                    language = "English"
+                    lang_instruction = lang_instructions["English"]
                 
                 # Build streaming prompt: TOON input + markdown output instructions
                 streaming_prompt = f"""You are an expert instructional designer. Generate a comprehensive, professional lesson plan in the EXACT format specified below.
@@ -693,7 +732,11 @@ OUTPUT: Generate a detailed lesson plan following this EXACT structure and forma
 
 - **Note**: [Adapt materials and recommendations as needed based on: {request.constraints or "None specified"}]
 
-REMEMBER: Write EVERYTHING in {language}. Use the EXACT materials specified: {request.available_materials or "Not specified"}. Consider these constraints: {request.constraints or "None specified"}. Make it appropriate for {request.grade_band} grade level and {request.available_time} minutes duration."""
+REMEMBER: Write EVERYTHING in {language}. All content, headings, and text must be in {language}. Use the EXACT materials specified: {request.available_materials or "Not specified"}. Consider these constraints: {request.constraints or "None specified"}. Make it appropriate for {request.grade_band} grade level and {request.available_time} minutes duration."""
+                
+                # Add language fallback note if language was changed from custom to English
+                if original_language == "Other" and language == "English" and request.language and request.language.strip():
+                    streaming_prompt += f"\n\nNOTE: The requested language '{request.language.strip()}' was not recognized. Content will be generated in English for reliability."
                 
                 # Override system message for streaming to request markdown output
                 streaming_system_message = (

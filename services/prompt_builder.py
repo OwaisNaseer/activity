@@ -34,11 +34,33 @@ def build_toon_prompt(request: ActivityRequest) -> str:
     language = request.output_language
     standard = request.standard
     
-    # Handle "Other" language option (same logic as old code)
+    # Define recognized languages (languages we know work well with LLMs)
+    RECOGNIZED_LANGUAGES = {
+        "English", "Spanish", "French", "German", "Italian", "Portuguese",
+        "Chinese", "Japanese", "Korean", "Russian", "Arabic", "Hindi",
+        "Dutch", "Swedish", "Norwegian", "Danish", "Finnish", "Polish",
+        "Turkish", "Greek", "Hebrew", "Thai", "Vietnamese", "Indonesian",
+        "Czech", "Romanian", "Hungarian", "Bulgarian", "Croatian", "Serbian"
+    }
+    
+    # Handle "Other" language option with validation
+    original_language = language
     if language == "Other":
-        language = request.language or "English"
-        if not language or language.strip() == "":
+        custom_language = request.language or "English"
+        if not custom_language or custom_language.strip() == "":
             language = "English"
+            logger.warning("Custom language was empty, defaulting to English")
+        else:
+            custom_language = custom_language.strip()
+            # Check if custom language is recognized
+            if custom_language not in RECOGNIZED_LANGUAGES:
+                logger.warning(
+                    f"Custom language '{custom_language}' is not recognized. "
+                    f"Falling back to English for reliable generation."
+                )
+                language = "English"
+            else:
+                language = custom_language
     
     # Map language names to language instructions (same as old code)
     language_instructions = {
@@ -52,15 +74,19 @@ def build_toon_prompt(request: ActivityRequest) -> str:
         "Japanese": "in Japanese (日本語で)",
     }
     
-    # Check if language is recognized (same logic as old code)
+    # Check if language is recognized - if not, fall back to English
     lang_instruction = language_instructions.get(language, None)
     if lang_instruction is None:
-        # Language not recognized - use English and add note
-        lang_instruction = "in English"
+        # Language not in our instruction map - fall back to English for safety
+        logger.warning(
+            f"Language '{language}' not in instruction map. "
+            f"Falling back to English for reliable generation."
+        )
+        language = "English"
+        lang_instruction = language_instructions["English"]
         language_note = (
-            f"\n\nIMPORTANT NOTE: The requested language '{language}' may not be "
-            "recognized or supported. The response will be generated in English. "
-            "If you need content in a different language, please specify a recognized language name."
+            f"\n\nNOTE: The requested language '{original_language}' was not recognized. "
+            f"Content will be generated in English for reliability."
         )
     else:
         language_note = ""
