@@ -159,8 +159,9 @@ class LLMClient:
         # Default system message
         if system_message is None:
             system_message = (
-                "You are an expert instructional designer who creates comprehensive, "
-                "well-structured lesson plans for educators."
+                "You are an expert instructional designer who outputs only valid "
+                "TOON (Token-Oriented Object Notation) format following the provided schema. "
+                "No JSON, no markdown, only TOON."
             )
         
         use_temperature = temperature if temperature is not None else self.temperature
@@ -253,8 +254,9 @@ class LLMClient:
         # Default system message
         if system_message is None:
             system_message = (
-                "You are an expert instructional designer who creates comprehensive, "
-                "well-structured lesson plans for educators."
+                "You are an expert instructional designer who outputs only valid "
+                "TOON (Token-Oriented Object Notation) format following the provided schema. "
+                "No JSON, no markdown, only TOON."
             )
         
         use_temperature = temperature if temperature is not None else self.temperature

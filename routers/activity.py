@@ -349,26 +349,32 @@ async def generate_activity(request: ActivityRequest):
         # Return response - ensure all fields are properly set
         try:
             if success and result:
-                # Result is markdown string(s) - same as old code
-                # No conversion needed, just return directly
-                if isinstance(result, list):
-                    logger.info(f"Markdown activities generated successfully ({len(result)} variants)")
+                # Result is now clean JSON dicts (validated with Pydantic) from TOON parsing
+                if isinstance(result, list) and result and isinstance(result[0], dict):
+                    logger.info(f"Structured activities generated successfully ({len(result)} variants)")
+                    # Convert validated JSON dicts to markdown for frontend (maintains compatibility)
+                    markdown_variants = []
+                    for variant_dict in result:
+                        markdown = lesson_plan_to_markdown(variant_dict)
+                        markdown_variants.append(markdown)
+                    
                     if num_variants == 1:
                         return ActivityResponse(
                             success=True,
-                            activity=result[0] if result else "",
+                            activity=markdown_variants[0] if markdown_variants else "",
                             activities=None,
-                            structured_activities=None,
+                            structured_activities=result,  # Also include clean JSON
                             error=None
                         )
                     else:
                         return ActivityResponse(
                             success=True,
                             activity=None,
-                            activities=result,
-                            structured_activities=None,
+                            activities=markdown_variants,  # Markdown for frontend
+                            structured_activities=result,  # Clean JSON for structured access
                             error=error
                         )
+                # Fallback for other result types
                 if isinstance(result, list):
                     logger.info(f"Text activities generated successfully ({len(result)} variants)")
                     return ActivityResponse(
@@ -528,22 +534,27 @@ async def generate_activity_stream(request: ActivityRequest):
                     yield f"data: {json.dumps({'type': 'error', 'content': error or 'Failed to generate template'})}\n\n"
                 return
             
-            # Build prompt
+            # Generate multiple variants with real-time streaming (like OpenAI)
+            num_variants = request.num_variants
+            logger.info(f"Generating {num_variants} variant(s) with real-time streaming...")
+            
+            # Build TOON prompt once (for input extraction)
             try:
                 from services.prompt_builder import build_toon_prompt
-                prompt = build_toon_prompt(request)
+                toon_prompt = build_toon_prompt(request)
             except Exception as prompt_error:
                 logger.error(f"Error building prompt: {str(prompt_error)}")
                 yield f"data: {json.dumps({'type': 'error', 'content': f'Error building prompt: {str(prompt_error)}'})}\n\n"
                 return
             
-            # Generate multiple variants with real-time streaming (like OpenAI)
-            num_variants = request.num_variants
-            logger.info(f"Generating {num_variants} variant(s) with real-time streaming...")
-            
-            # Build prompt once (same for all variants)
-            from services.prompt_builder import build_toon_prompt
-            prompt = build_toon_prompt(request)
+            # Extract TOON input section from prompt (everything before "OUTPUT:")
+            toon_input_start = toon_prompt.find("INPUT (TOON")
+            toon_input_end = toon_prompt.find("OUTPUT:", toon_input_start)
+            if toon_input_start >= 0 and toon_input_end >= 0:
+                toon_input_section = toon_prompt[toon_input_start:toon_input_end].strip()
+            else:
+                # Fallback: use full prompt if extraction fails
+                toon_input_section = toon_prompt
             
             # Generate each variant with real-time streaming
             for variant_idx in range(num_variants):
@@ -557,35 +568,154 @@ async def generate_activity_stream(request: ActivityRequest):
                 temp_variation = generator.llm_client.temperature + (variant_idx * 0.1)
                 logger.info(f"Generating variant {variant_idx + 1} with temperature {temp_variation:.2f}")
                 
-                # Stream directly from LLM to frontend (real-time, like OpenAI)
-                chunk_count = 0
-                accumulated_content = ""
+                # Build streaming prompt: TOON input + markdown output (for real-time display)
+                
+                # Build markdown output prompt (same structure as old code)
+                from services.prompt_builder import build_toon_prompt
+                # Get language instruction
+                language = request.output_language
+                if language == "Other":
+                    language = request.language or "English"
+                lang_instructions = {
+                    "English": "in English",
+                    "Spanish": "in Spanish (en español)",
+                    "French": "in French (en français)",
+                    "German": "in German (auf Deutsch)",
+                    "Italian": "in Italian (in italiano)",
+                    "Portuguese": "in Portuguese (em português)",
+                    "Chinese": "in Chinese (用中文)",
+                    "Japanese": "in Japanese (日本語で)",
+                }
+                lang_instruction = lang_instructions.get(language, "in English")
+                
+                # Build streaming prompt: TOON input + markdown output instructions
+                streaming_prompt = f"""You are an expert instructional designer. Generate a comprehensive, professional lesson plan in the EXACT format specified below.
+
+{toon_input_section}
+
+OUTPUT: Generate a detailed lesson plan following this EXACT structure and format. Write everything {lang_instruction}:
+
+# [Lesson Title: {request.topic_concept}]
+
+## LEARNING OBJECTIVE
+
+[Write a clear, measurable learning objective. Students will...]
+
+## ASSESSMENT
+
+[Describe how students will demonstrate mastery. Include: working prototype/demonstration, written explanation, rubric-based assessment covering reliability, component interaction, and justification of choices/safety considerations.]
+
+## KEY POINTS
+
+- [Core concept 1: e.g., Fundamentals related to the topic]
+
+- [Core concept 2: e.g., Practical application and hands-on learning]
+
+- [Core concept 3: e.g., Design process and documentation]
+
+- [Core concept 4: e.g., Safety and classroom management]
+
+- [Core concept 5: Add more as appropriate for the topic]
+
+## OPENING
+
+- **Hook (1-2 minutes)**: [Brief video/demo or engaging introduction]
+
+- **Goal Explanation**: [Explain the lesson's goal and what students will accomplish]
+
+- **Group Organization**: [Organize students into groups of 3-4 with assigned roles: project manager, builder, programmer, tester/documenter]
+
+- **Anticipatory Question**: [Pose a question to engage students]
+
+## INTRODUCTION TO NEW MATERIAL
+
+[5-8 minutes per mini-topic]
+
+- **Key Concepts**: [Explain main concepts related to {request.topic_concept}]
+
+- **Materials Overview**: [Explain how to use: {request.available_materials or "Not specified"}]
+
+- **Basic Principles**: [Explain fundamental principles]
+
+- **Active Learning**: [Include hands-on activity or demonstration]
+
+- **Common Misconception**: [Address a common misconception about the topic]
+
+## GUIDED PRACTICE
+
+- **Behavioral Expectations**: [Set clear expectations for student behavior]
+
+- **Component Identification (5 minutes)**: [Activity to identify key elements]
+
+- **Simple Activity Build (10 minutes)**: [Step-by-step activity building]
+
+- **Practice Exercise (10-15 minutes)**: [Guided practice with teacher support and guiding questions]
+
+- **Task Challenge Introduction (10 minutes)**: [Introduce the main challenge with success criteria and model timeline]
+
+- **Monitoring**: [Use checklist and probing questions to monitor student performance]
+
+## INDEPENDENT PRACTICE
+
+- **Behavioral Expectations**: [Set expectations for collaborative work]
+
+- **Assignment**: [Teams design and complete the main activity]
+
+- **Deliverables**: 
+
+  - Working prototype or completed work
+
+  - One-page design explanation
+
+  - Team demonstration
+
+- **Timeline**: [Adapt for {request.available_time} minute lesson or split across two class periods]
+
+- **Teacher Support**: [Mini-lessons and rubric for formative feedback]
+
+## CLOSING
+
+- **Exit Activity**: [Quick activity where teams share success/challenge]
+
+- **Restatement**: [Restate learning objective and assessment criteria]
+
+## EXTENSION ACTIVITY
+
+[For early finishers: Add a secondary objective or challenge with documentation and testing]
+
+## HOMEWORK
+
+[Individual reflection/journal on activity behavior, technical challenges, and potential improvements with additional resources]
+
+## STANDARDS ALIGNED
+
+- **Relevant Standards**: [List applicable educational standards for {request.subject} at {request.grade_band} level{f" that align with: {request.standard}" if request.standard and request.standard.strip() else ""}]
+
+- **Note**: [Adapt materials and recommendations as needed based on: {request.constraints or "None specified"}]
+
+REMEMBER: Write EVERYTHING in {language}. Use the EXACT materials specified: {request.available_materials or "Not specified"}. Consider these constraints: {request.constraints or "None specified"}. Make it appropriate for {request.grade_band} grade level and {request.available_time} minutes duration."""
+                
+                # Override system message for streaming to request markdown output
+                streaming_system_message = (
+                    "You are an expert instructional designer who creates comprehensive, "
+                    "well-structured lesson plans for educators."
+                )
                 
                 try:
-                    # Stream directly from LLM - no delays, real-time
-                    for chunk in generator.llm_client.generate_stream(prompt, temperature=temp_variation):
+                    # Stream raw LLM chunks directly to frontend (real-time typing feel)
+                    for chunk in generator.llm_client.generate_stream(
+                        streaming_prompt, 
+                        temperature=temp_variation,
+                        system_message=streaming_system_message
+                    ):
                         if chunk.startswith("ERROR:"):
                             logger.error(f"LLM stream error: {chunk}")
                             yield f"data: {json.dumps({'type': 'error', 'content': chunk, 'variant': variant_idx + 1})}\n\n"
                             break
                         
-                        # Send chunk directly to frontend (real-time streaming)
+                        # Stream chunks directly to frontend (real-time, no delays)
                         if chunk:
-                            chunk_count += 1
-                            accumulated_content += chunk
-                            # Stream directly - no artificial delays
                             yield f"data: {json.dumps({'type': 'content', 'content': chunk, 'variant': variant_idx + 1})}\n\n"
-                            
-                            # Send status update every 50 chunks
-                            if chunk_count % 50 == 0:
-                                yield f"data: {json.dumps({'type': 'status', 'content': f'Generating... ({chunk_count} chunks)', 'variant': variant_idx + 1})}\n\n"
-                    
-                    logger.info(f"Streamed {chunk_count} chunks ({len(accumulated_content)} chars) for variant {variant_idx + 1}")
-                    
-                    if not accumulated_content or len(accumulated_content.strip()) < 10:
-                        logger.error(f"Received empty or very short response for variant {variant_idx + 1}")
-                        yield f"data: {json.dumps({'type': 'error', 'content': f'Received empty response for variant {variant_idx + 1}', 'variant': variant_idx + 1})}\n\n"
-                        continue
                     
                     # Variant complete
                     yield f"data: {json.dumps({'type': 'variant_complete', 'variant': variant_idx + 1, 'index': variant_idx})}\n\n"

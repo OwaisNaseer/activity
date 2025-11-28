@@ -113,22 +113,29 @@ class ActivityGenerator:
                     logger.warning(f"LLM generation failed: {error}")
                     return self._generate_template_response(request, num_variants)
                 
-                # Old code returned markdown directly - keep same behavior
-                # LLM returns markdown (like old code), no TOON parsing needed
+                # LLM returns TOON format - parse, validate, and return clean JSON
                 if raw_response:
-                    logger.info(f"✓ Successfully generated markdown response ({len(raw_response)} chars)")
+                    logger.info(f"✓ Successfully received TOON response ({len(raw_response)} chars)")
                     
-                    # Handle multiple variants like old code (generate multiple times with temp variation)
-                    if num_variants == 1:
-                        # Single variant - return string (backward compatible)
-                        return True, raw_response, None
-                    else:
-                        # Multiple variants - generate each with slight temperature variation
-                        variants = [raw_response]  # First variant
-                        errors = []
-                        
-                        for variant_idx in range(1, num_variants):
-                            # Use slight temperature variation for each variant (like old code)
+                    # Parse and validate TOON response
+                    parse_success, structured_variants, parse_error = self._parse_and_validate_response(
+                        raw_response,
+                        num_variants
+                    )
+                    
+                    if parse_success and structured_variants:
+                        logger.info(
+                            f"✓ Successfully parsed and validated {len(structured_variants)} variant(s) from TOON"
+                        )
+                        # Return clean JSON dicts (validated with Pydantic)
+                        return True, structured_variants, None
+                    
+                    logger.warning(f"TOON parsing/validation failed: {parse_error}")
+                    
+                    # If parsing failed, try generating additional variants if needed
+                    if num_variants > 1 and len(structured_variants or []) < num_variants:
+                        # Generate remaining variants with temperature variation
+                        for variant_idx in range(len(structured_variants or []), num_variants):
                             temp_variation = self.llm_client.temperature + (variant_idx * 0.1)
                             logger.info(f"Generating variant {variant_idx + 1}/{num_variants} with temperature {temp_variation:.2f}")
                             
@@ -138,22 +145,23 @@ class ActivityGenerator:
                             )
                             
                             if variant_success and variant_response:
-                                variants.append(variant_response)
-                                logger.info(f"✓ Successfully generated variant {variant_idx + 1}")
+                                var_parse_success, var_structured, var_parse_error = self._parse_and_validate_response(
+                                    variant_response,
+                                    1
+                                )
+                                if var_parse_success and var_structured:
+                                    structured_variants.extend(var_structured)
+                                    logger.info(f"✓ Successfully generated and validated variant {variant_idx + 1}")
+                                else:
+                                    logger.warning(f"Failed to parse variant {variant_idx + 1}: {var_parse_error}")
                             else:
-                                errors.append(f"Variant {variant_idx + 1}: {variant_error or 'Unknown error'}")
                                 logger.warning(f"Failed to generate variant {variant_idx + 1}: {variant_error}")
                         
-                        if len(variants) == num_variants:
-                            logger.info(f"✓ Successfully generated all {num_variants} variants!")
-                            return True, variants, None
-                        elif variants:
-                            error_msg = f"Generated {len(variants)}/{num_variants} variants. Some failed: {'; '.join(errors)}"
-                            logger.warning(error_msg)
-                            return True, variants, error_msg
-                        else:
-                            logger.warning("All variants failed, using template response")
-                            return self._generate_template_response(request, num_variants)
+                        if structured_variants and len(structured_variants) > 0:
+                            return True, structured_variants, None
+                    
+                    # Fall back to template if parsing failed
+                    return self._generate_template_response(request, num_variants)
                 
                 logger.warning("Empty response from LLM")
                 return self._generate_template_response(request, num_variants)
@@ -230,18 +238,21 @@ class ActivityGenerator:
             toon_data = toon_to_json(raw_text)
             logger.info("Successfully decoded TOON format response")
             
-            # Extract variants from TOON structure
-            if "variants" in toon_data:
+            # Extract variants from TOON structure (professional parsing)
+            if "variants" in toon_data and isinstance(toon_data["variants"], list):
                 variants_data = toon_data["variants"]
-            elif "lesson" in toon_data:
-                variants_data = (
-                    toon_data["lesson"]
-                    if isinstance(toon_data["lesson"], list)
-                    else [toon_data["lesson"]]
-                )
+                logger.debug(f"Found {len(variants_data)} variants in 'variants' key")
+            elif isinstance(toon_data, list):
+                variants_data = toon_data
+                logger.debug(f"TOON data is a list with {len(variants_data)} items")
+            elif isinstance(toon_data, dict) and "schema" in toon_data:
+                # Single lesson plan object with schema
+                variants_data = [toon_data]
+                logger.debug("TOON data is a single lesson plan object")
             else:
-                # Single lesson object or root is the lesson
+                # Root is the lesson or unknown structure
                 variants_data = [toon_data] if toon_data else []
+                logger.debug(f"Using root as single variant (type: {type(toon_data)})")
             
             if not variants_data:
                 return False, None, "No variants in TOON response"
