@@ -1,7 +1,11 @@
+import json
 import os
 import logging
-from typing import Optional, List, Union
+from typing import Optional, List
 from dotenv import load_dotenv
+from pydantic import ValidationError
+
+from utils.toon_utils import json_to_toon, toon_to_json
 
 # Load environment variables from .env file
 load_dotenv()
@@ -22,6 +26,11 @@ def _get_openai():
             logger.error(f"Failed to import openai: {str(e)}")
             raise ImportError("openai package is not installed. Please install it with: pip install openai")
     return _openai
+
+# TOON schema identifiers (for reference in prompts)
+LESSON_SCHEMA = "toon.lesson.v1"
+BUNDLE_SCHEMA = "toon.bundle.v1"
+
 
 class ActivityGenerator:
     """Service for generating activities using OpenAI API"""
@@ -64,7 +73,7 @@ class ActivityGenerator:
             logger.error(f"Error initializing OpenAI client: {str(e)}")
             self.client = None
     
-    def generate_activity(self, request_data: dict) -> tuple[bool, Union[Optional[str], Optional[List[str]]], Optional[str]]:
+    def generate_activity(self, request_data: dict) -> tuple[bool, Optional[List[dict]], Optional[str]]:
         """
         Generate activity description using OpenAI API
         
@@ -89,7 +98,7 @@ class ActivityGenerator:
             
             # Build the prompt
             try:
-                prompt = self._build_prompt(request_data)
+                prompt = self._build_toon_prompt(request_data)
             except Exception as prompt_error:
                 logger.error(f"Error building prompt: {str(prompt_error)}")
                 # Fall back to template
@@ -97,50 +106,27 @@ class ActivityGenerator:
             
             # Try to generate with OpenAI
             try:
-                logger.info(f"Generating {num_variants} variant(s) using OpenAI API...")
-                logger.info(f"Generator state - API Key: {'Set' if self.api_key else 'Not set'}, Client: {'Initialized' if self.client else 'Not initialized'}")
+                logger.info(f"Generating {num_variants} structured variant(s) using OpenAI API...")
+                logger.info(
+                    "Generator state - API Key: %s, Client: %s",
+                    "Set" if self.api_key else "Not set",
+                    "Initialized" if self.client else "Not initialized",
+                )
+
+                result = self._generate_with_openai(prompt)
                 
-                if num_variants == 1:
-                    # Single variant - backward compatible
-                    result = self._generate_with_openai(prompt)
-                    
-                    if result and len(result) >= 3 and result[0] and result[1]:
-                        logger.info("✓ Successfully generated activity using OpenAI!")
-                        return result
-                    else:
-                        error_detail = result[2] if result and len(result) > 2 else 'Unknown error'
-                        logger.warning(f"OpenAI generation failed, using template. Error: {error_detail}")
-                        return self._generate_template_response(request_data, num_variants)
-                else:
-                    # Multiple variants
-                    variants = []
-                    errors = []
-                    
-                    for variant_idx in range(num_variants):
-                        # Use slight temperature variation for each variant
-                        temp_variation = self.temperature + (variant_idx * 0.1)
-                        logger.info(f"Generating variant {variant_idx + 1}/{num_variants} with temperature {temp_variation:.2f}")
-                        
-                        result = self._generate_with_openai(prompt, temperature=temp_variation)
-                        
-                        if result and len(result) >= 3 and result[0] and result[1]:
-                            variants.append(result[1])
-                            logger.info(f"✓ Successfully generated variant {variant_idx + 1}")
-                        else:
-                            error_detail = result[2] if result and len(result) > 2 else 'Unknown error'
-                            errors.append(f"Variant {variant_idx + 1}: {error_detail}")
-                            logger.warning(f"Failed to generate variant {variant_idx + 1}: {error_detail}")
-                    
-                    if variants:
-                        if len(variants) == num_variants:
-                            logger.info(f"✓ Successfully generated all {num_variants} variants!")
-                            return True, variants, None
-                        else:
-                            logger.warning(f"Generated {len(variants)}/{num_variants} variants. Errors: {errors}")
-                            return True, variants, f"Generated {len(variants)}/{num_variants} variants. Some failed: {'; '.join(errors)}"
-                    else:
-                        logger.warning("All variants failed, using template response")
-                        return self._generate_template_response(request_data, num_variants)
+                if result and len(result) >= 3 and result[0] and result[1]:
+                    parse_success, structured_variants, parse_error = self._parse_toon_response(result[1], num_variants)
+                    if parse_success:
+                        logger.info("✓ Successfully parsed %s variant(s) from TOON/JSON response", len(structured_variants))
+                        return True, structured_variants, None
+
+                    logger.warning(f"TOON/JSON parsing failed: {parse_error}")
+                    return self._generate_template_response(request_data, num_variants)
+
+                error_detail = result[2] if result and len(result) > 2 else "Unknown error"
+                logger.warning(f"OpenAI generation failed, using template. Error: {error_detail}")
+                return self._generate_template_response(request_data, num_variants)
                         
             except Exception as openai_error:
                 logger.error(f"OpenAI API exception: {type(openai_error).__name__}: {str(openai_error)}", exc_info=True)
@@ -159,8 +145,11 @@ class ActivityGenerator:
                 # Last resort - return a basic error
                 return False, None, f"Error generating activity: {str(e)}"
     
-    def _build_prompt(self, data: dict) -> str:
-        """Build a detailed prompt for OpenAI to generate lesson plan"""
+    def _build_toon_prompt(self, data: dict) -> str:
+        """Build TOON-format prompt: JSON → TOON → LLM.
+        
+        Converts request data to TOON format for token-efficient LLM communication.
+        """
         subject = data.get("subject", "N/A")
         grade_band = data.get("grade_band", "N/A")
         topic = data.get("topic_concept", "N/A")
@@ -168,129 +157,112 @@ class ActivityGenerator:
         constraints = data.get("constraints", "None specified")
         available_time = data.get("available_time", 0)
         language = data.get("output_language", "English")
-        standard = data.get("standard", None)
+        standard = data.get("standard", "")
+        num_variants = data.get("num_variants", 1)
         
-        # Handle "Other" language option
         if language == "Other":
-            language = data.get("language", "English")
-            if not language or language.strip() == "":
-                language = "English"
+            language = data.get("language", "English") or "English"
         
-        # Map language names to language instructions
-        language_instructions = {
-            "English": "in English",
-            "Spanish": "in Spanish (en español)",
-            "French": "in French (en français)",
-            "German": "in German (auf Deutsch)",
-            "Italian": "in Italian (in italiano)",
-            "Portuguese": "in Portuguese (em português)",
-            "Chinese": "in Chinese (用中文)",
-            "Japanese": "in Japanese (日本語で)",
+        # Convert request to TOON format
+        # TOON (Token-Oriented Object Notation) spec: https://github.com/toon-format/spec
+        # Python library: https://github.com/toon-format/toon
+        # Example: {"name": "Alice", "age": 30} → "name: Alice\nage: 30"
+        # Arrays: users[2]{id,name}: 1,Alice\n2,Bob
+        request_dict = {
+            "subject": subject,
+            "grade_band": grade_band,
+            "topic": topic,
+            "available_time": available_time,
+            "materials": materials,
+            "constraints": constraints,
+            "language": language,
+            "standard": standard,
+            "num_variants": num_variants
         }
         
-        # Check if language is recognized
-        lang_instruction = language_instructions.get(language, None)
-        if lang_instruction is None:
-            # Language not recognized - use English and add note
-            lang_instruction = "in English"
-            language_note = f"\n\nIMPORTANT NOTE: The requested language '{language}' may not be recognized or supported. The response will be generated in English. If you need content in a different language, please specify a recognized language name."
-        else:
-            language_note = ""
+        try:
+            # Uses toon.encode() from the official toon library
+            toon_input = json_to_toon(request_dict)
+        except Exception as e:
+            logger.warning(f"Failed to encode TOON input: {e}, using fallback")
+            # Simple fallback
+            toon_input = f"subject: {subject}\ngrade_band: {grade_band}\ntopic: {topic}\navailable_time: {available_time}\nmaterials: {materials}\nconstraints: {constraints}\nlanguage: {language}\nstandard: {standard}\nnum_variants: {num_variants}"
         
-        # Build standard instruction
-        standard_instruction = ""
-        if standard and standard.strip():
-            standard_instruction = f"\n\nIMPORTANT: If the provided standard '{standard}' is not valid or not recognized, mention this professionally in the STANDARDS ALIGNED section as: 'Note: The provided standard may not be recognized or validated. Please adapt materials and recommendations as needed based on the constraints and available resources.'"
-
-        prompt = f"""You are an expert instructional designer. Generate a comprehensive, professional lesson plan in the EXACT format specified below.
-
-IMPORTANT: Write the ENTIRE response {lang_instruction}. All content must be in {language}.{language_note}{standard_instruction}
-
-Subject: {subject}
-Grade/Band: {grade_band}
-Topic/Concept: {topic}
-Available Materials: {materials}
-Constraints: {constraints}
-Available Time: {available_time} minutes
-Output Language: {language} (MUST write in {language})"""
+        standard_note = f" If standard '{standard}' is provided, mention it professionally in notes." if standard else ""
         
-        if standard and standard.strip():
-            prompt += f"\nEducational Standard: {standard}"
+        # Simple TOON output example
+        prompt = f"""You are an expert instructional designer. Use TOON (Token-Oriented Object Notation) format.
 
-        prompt += f"""
+INPUT (TOON):
+{toon_input}
 
-Generate a detailed lesson plan following this EXACT structure and format. Write everything {lang_instruction}:
+OUTPUT: Respond in TOON format with this structure:
+variants[{num_variants}]{{schema,meta,title,key_points,objectives,assessment,sections,extension,homework,notes,materials}}:
+  toon.lesson.v1,meta{{subject,grade_band,topic,available_time,language,standard,constraints}},string,key_points[5]{{string}},objectives[]{{label,text}},assessment{{overview,criteria[]{{focus,detail}}}},sections[]{{id,title,goal,steps[]{{label,duration,detail}}}},extension{{title,detail}},homework{{prompt,deliverable}},notes[]{{string}},materials[]{{string}}
 
-# [Lesson Title: {topic}]
+RULES:
+- Respond ONLY in TOON format. No JSON, no markdown, no prose.
+- Respond in {language} with concise, professional sentences.
+- key_points: Exactly 5 items covering: fundamentals, practical application, design process, documentation, safety/classroom management.
+- Keep tokens minimal: short labels, focused details.{standard_note}
+- Generate exactly {num_variants} variant(s).
 
-## LEARNING OBJECTIVE
-[Write a clear, measurable learning objective. Students will...]
-
-## ASSESSMENT
-[Describe how students will demonstrate mastery. Include: working prototype/demonstration, written explanation, rubric-based assessment covering reliability, component interaction, and justification of choices/safety considerations.]
-
-## KEY POINTS
-- [Core concept 1: e.g., Fundamentals related to the topic]
-- [Core concept 2: e.g., Practical application and hands-on learning]
-- [Core concept 3: e.g., Design process and documentation]
-- [Core concept 4: e.g., Safety and classroom management]
-- [Core concept 5: Add more as appropriate for the topic]
-
-## OPENING
-- **Hook (1-2 minutes)**: [Brief video/demo or engaging introduction]
-- **Goal Explanation**: [Explain the lesson's goal and what students will accomplish]
-- **Group Organization**: [Organize students into groups of 3-4 with assigned roles: project manager, builder, programmer, tester/documenter]
-- **Anticipatory Question**: [Pose a question to engage students]
-
-## INTRODUCTION TO NEW MATERIAL
-[5-8 minutes per mini-topic]
-- **Key Concepts**: [Explain main concepts related to {topic}]
-- **Materials Overview**: [Explain how to use: {materials}]
-- **Basic Principles**: [Explain fundamental principles]
-- **Active Learning**: [Include hands-on activity or demonstration]
-- **Common Misconception**: [Address a common misconception about the topic]
-
-## GUIDED PRACTICE
-- **Behavioral Expectations**: [Set clear expectations for student behavior]
-- **Component Identification (5 minutes)**: [Activity to identify key elements]
-- **Simple Activity Build (10 minutes)**: [Step-by-step activity building]
-- **Practice Exercise (10-15 minutes)**: [Guided practice with teacher support and guiding questions]
-- **Task Challenge Introduction (10 minutes)**: [Introduce the main challenge with success criteria and model timeline]
-- **Monitoring**: [Use checklist and probing questions to monitor student performance]
-
-## INDEPENDENT PRACTICE
-- **Behavioral Expectations**: [Set expectations for collaborative work]
-- **Assignment**: [Teams design and complete the main activity]
-- **Deliverables**: 
-  - Working prototype or completed work
-  - One-page design explanation
-  - Team demonstration
-- **Timeline**: [Adapt for {available_time} minute lesson or split across two class periods]
-- **Teacher Support**: [Mini-lessons and rubric for formative feedback]
-
-## CLOSING
-- **Exit Activity**: [Quick activity where teams share success/challenge]
-- **Restatement**: [Restate learning objective and assessment criteria]
-
-## EXTENSION ACTIVITY
-[For early finishers: Add a secondary objective or challenge with documentation and testing]
-
-## HOMEWORK
-[Individual reflection/journal on activity behavior, technical challenges, and potential improvements with additional resources]
-
-## STANDARDS ALIGNED"""
+Begin TOON response:"""
         
-        # Add standard alignment note if standard is provided
-        standard_align_text = ""
-        if standard and standard.strip():
-            standard_align_text = f" that align with: {standard}"
+        return prompt.strip()
+    
+    def _generate_with_openai_stream(self, prompt: str, temperature: Optional[float] = None):
+        """Generate text using OpenAI API with streaming.
         
-        prompt += f"""
-- **Relevant Standards**: [List applicable educational standards for {subject} at {grade_band} level{standard_align_text}]
-- **Note**: [Adapt materials and recommendations as needed based on: {constraints}]
-
-REMEMBER: Write EVERYTHING in {language}. Use the EXACT materials specified: {materials}. Consider these constraints: {constraints}. Make it appropriate for {grade_band} grade level and {available_time} minutes duration."""
-        return prompt
+        Yields:
+            str: Chunks of generated text as they arrive
+        """
+        try:
+            if not self.client:
+                yield "ERROR: OpenAI client is not initialized"
+                return
+            
+            if not self.api_key:
+                yield "ERROR: OPENAI_API_KEY is not configured"
+                return
+            
+            use_temperature = temperature if temperature is not None else self.temperature
+            
+            logger.info(f"Streaming from OpenAI API with model: {self.model}, temperature: {use_temperature}")
+            
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert instructional designer who outputs only valid TOON (Token-Oriented Object Notation) format following the provided schema. No JSON, no markdown, only TOON."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=use_temperature,
+                max_tokens=2500,
+                stream=True
+            )
+            
+            accumulated_text = ""
+            for chunk in stream:
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta
+                    if delta and delta.content:
+                        content = delta.content
+                        accumulated_text += content
+                        yield content
+            
+            logger.info(f"✓ Streamed {len(accumulated_text)} characters")
+            
+        except Exception as e:
+            error_type = type(e).__name__
+            error_msg = str(e)
+            logger.error(f"OpenAI Streaming Error - Type: {error_type}, Message: {error_msg}")
+            yield f"ERROR: {error_msg}"
     
     def _generate_with_openai(self, prompt: str, temperature: Optional[float] = None) -> tuple[bool, Optional[str], Optional[str]]:
         """Generate text using OpenAI API
@@ -323,7 +295,7 @@ REMEMBER: Write EVERYTHING in {language}. Use the EXACT materials specified: {ma
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are an expert instructional designer who creates comprehensive, well-structured lesson plans for educators."
+                        "content": "You are an expert instructional designer who outputs only valid TOON (Token-Oriented Object Notation) format following the provided schema. No JSON, no markdown, only TOON."
                     },
                     {
                         "role": "user",
@@ -331,7 +303,7 @@ REMEMBER: Write EVERYTHING in {language}. Use the EXACT materials specified: {ma
                     }
                 ],
                 temperature=use_temperature,
-                max_tokens=4000
+                max_tokens=2500
             )
             
             logger.info(f"OpenAI API response received: {type(response)}")
@@ -373,77 +345,205 @@ REMEMBER: Write EVERYTHING in {language}. Use the EXACT materials specified: {ma
             logger.error(detailed_error)
             return False, None, detailed_error
     
-    def _generate_template_response(self, data: dict, num_variants: int = 1) -> tuple[bool, Union[Optional[str], Optional[List[str]]], Optional[str]]:
-        """Generate a template-based response when OpenAI fails
+    def _parse_toon_response(self, raw_text: str, expected_variants: int) -> tuple[bool, Optional[List[dict]], Optional[str]]:
+        """Parse TOON response from LLM: TOON → JSON (dict).
         
-        Returns:
-            For num_variants=1: (bool, str, str)
-            For num_variants>1: (bool, List[str], str)
+        Simple flow: LLM returns TOON → decode to dict → return dicts.
+        Falls back to JSON parsing if TOON decode fails.
         """
-        standard = data.get("standard", None)
-        subject = data.get("subject", "the subject")
-        grade_band = data.get("grade_band", "the grade level")
-        topic = data.get("topic_concept", "the topic")
+        # Try TOON format first (primary method)
+        try:
+            toon_data = toon_to_json(raw_text)
+            logger.info("Successfully decoded TOON format response")
+            
+            # Extract variants from TOON structure
+            if "variants" in toon_data:
+                variants_data = toon_data["variants"]
+            elif "lesson" in toon_data:
+                variants_data = toon_data["lesson"] if isinstance(toon_data["lesson"], list) else [toon_data["lesson"]]
+            else:
+                # Single lesson object or root is the lesson
+                variants_data = [toon_data] if toon_data else []
+            
+            if not variants_data:
+                return False, None, "No variants in TOON response"
+            
+            # Return dicts (limit to expected variants)
+            serialized = [dict(v) for v in variants_data[:expected_variants]]
+            return True, serialized, None
+            
+        except Exception as toon_error:
+            logger.debug(f"TOON parsing failed: {toon_error}, trying JSON fallback")
+            
+            # Fallback to JSON parsing
+            try:
+                json_str = self._extract_json(raw_text)
+                payload = json.loads(json_str)
+                logger.info("Successfully parsed JSON format response (fallback)")
+                
+                # Extract variants from JSON
+                if "variants" in payload:
+                    variants_data = payload["variants"]
+                else:
+                    variants_data = [payload]
+                
+                if not variants_data:
+                    return False, None, "No variants in JSON payload"
+                
+                serialized = [dict(v) for v in variants_data[:expected_variants]]
+                return True, serialized, None
+                
+            except Exception as json_error:
+                logger.error(f"Both TOON and JSON parsing failed. TOON: {toon_error}, JSON: {json_error}")
+                return False, None, f"Failed to parse response. TOON error: {toon_error}, JSON error: {json_error}"
+
+    @staticmethod
+    def _extract_json(raw_text: str) -> str:
+        """Remove code fences and isolate the JSON object."""
+        if "```" in raw_text:
+            start = raw_text.find("```")
+            end = raw_text.rfind("```")
+            if start != -1 and end != -1 and end > start:
+                raw_text = raw_text[start + 3 : end]
         
-        standard_note = ""
-        if standard and standard.strip():
-            standard_note = f"\n- **Note**: The provided standard '{standard}' may not be recognized or validated. Please adapt materials and recommendations as needed."
+        first_brace = raw_text.find("{")
+        last_brace = raw_text.rfind("}")
         
-        base_activity = f"""# {topic}
-
-## LEARNING OBJECTIVE
-Students will understand the key concepts of {topic} and apply their knowledge through hands-on activities.
-
-## ASSESSMENT
-Students will demonstrate mastery through:
-- Working prototype or demonstration
-- Written explanation of their work
-- Rubric-based assessment covering reliability, component interaction, and justification of choices
-
-## KEY POINTS
-- Core concepts related to {topic}
-- Practical application and hands-on learning
-- Design process and documentation
-- Safety considerations
-
-## OPENING
-- **Hook (1-2 minutes)**: Brief introduction to engage students
-- **Goal Explanation**: Explain what students will accomplish
-- **Group Organization**: Organize students into groups with assigned roles
-- **Anticipatory Question**: Pose an engaging question
-
-## INTRODUCTION TO NEW MATERIAL
-Introduce key concepts and materials needed for the activity.
-
-## GUIDED PRACTICE
-Scaffolded activities with teacher facilitation and support.
-
-## INDEPENDENT PRACTICE
-Students work in teams to complete the main activity.
-
-## CLOSING
-Review key concepts and assess understanding.
-
-## EXTENSION ACTIVITY
-Additional challenges for early finishers.
-
-## HOMEWORK
-Reflection and journaling on the activity.
-
-## STANDARDS ALIGNED
-- **Relevant Standards**: [List applicable educational standards for {subject} at {grade_band} level]{standard_note}
-
-*Note: This is a template-based response generated because OpenAI API call failed.*"""
+        if first_brace == -1 or last_brace == -1:
+            raise ValueError("JSON braces not found in model response")
         
-        if num_variants == 1:
-            return True, base_activity, None
-        else:
-            # Generate multiple template variants with slight variations
-            variants = []
-            for i in range(num_variants):
-                variant = base_activity.replace(
-                    "Lesson Plan",
-                    f"Lesson Plan (Variant {i + 1})"
-                )
-                variants.append(variant)
-            return True, variants, None
+        return raw_text[first_brace : last_brace + 1]
+
+    def _generate_template_response(self, data: dict, num_variants: int = 1) -> tuple[bool, Optional[List[dict]], Optional[str]]:
+        """Generate a structured template when OpenAI fails."""
+        variants = []
+        for idx in range(num_variants):
+            variants.append(self._build_template_plan(data, idx))
+        
+        return True, variants, "Template response used due to generator fallback"
+
+    def _build_template_plan(self, data: dict, variant_index: int) -> dict:
+        """Build a deterministic LessonPlan for fallback scenarios."""
+        subject = data.get("subject", "Subject")
+        grade_band = data.get("grade_band", "Grade")
+        topic = data.get("topic_concept", "Topic")
+        available_time = data.get("available_time", 45)
+        language = data.get("output_language", "English")
+        materials = self._split_materials(data.get("available_materials", ""))
+        constraints = data.get("constraints", "None listed")
+        
+        meta = LessonMeta(
+            subject=subject,
+            grade_band=grade_band,
+            topic=topic,
+            available_time=available_time,
+            language=language,
+            standard=data.get("standard"),
+            constraints=constraints,
+        )
+        
+        objectives = [
+            LessonObjective(label="Obj1", text=f"Students will explain the core ideas of {topic}."),
+            LessonObjective(label="Obj2", text=f"Students will apply {topic} by building a quick demonstration."),
+        ]
+        
+        assessment = Assessment(
+            overview="Teams present a working demo, submit a brief explanation, and receive rubric-based feedback.",
+            criteria=[
+                AssessmentCriterion(focus="Prototype", detail="Demonstrates the target concept reliably."),
+                AssessmentCriterion(focus="Documentation", detail="Clear explanation of choices and safety considerations."),
+                AssessmentCriterion(focus="Reflection", detail="Team reflects on improvements and constraints."),
+            ],
+        )
+        
+        sections = [
+            LessonSection(
+                id="opening",
+                title="Opening",
+                goal="Launch curiosity and set expectations.",
+                steps=[
+                    LessonStep(label="Hook", duration="2m", detail=f"Quick demo or question to connect with {topic}."),
+                    LessonStep(label="Goal", duration="2m", detail="State outcomes and success criteria."),
+                    LessonStep(label="Roles", duration="3m", detail="Assign team roles and clarify expectations."),
+                ],
+            ),
+            LessonSection(
+                id="introduction",
+                title="Introduction to New Material",
+                goal="Model the core knowledge required for the build.",
+                steps=[
+                    LessonStep(label="Key Idea", duration="5m", detail=f"Mini-lesson on fundamental {topic} concepts."),
+                    LessonStep(label="Materials", duration="3m", detail=f"Show how to use {', '.join(materials) or 'available materials'} safely."),
+                    LessonStep(label="Misconception", duration="3m", detail="Surface and correct a likely misconception."),
+                ],
+            ),
+            LessonSection(
+                id="guided_practice",
+                title="Guided Practice",
+                goal="Rehearse core moves with coaching.",
+                steps=[
+                    LessonStep(label="Walkthrough", duration="10m", detail="Teacher-led build of a mini-example."),
+                    LessonStep(label="Checklist", duration="5m", detail="Teams verify understanding with prompts and probes."),
+                ],
+            ),
+            LessonSection(
+                id="independent_practice",
+                title="Independent Practice",
+                goal="Teams complete the primary challenge.",
+                steps=[
+                    LessonStep(label="Build Sprint", duration=f"{available_time - 20}m", detail="Teams construct, test, and iterate."),
+                    LessonStep(label="Deliverables", duration="5m", detail="Prototype, one-page explanation, quick stand-up."),
+                ],
+            ),
+            LessonSection(
+                id="closing",
+                title="Closing",
+                goal="Synthesize learning and preview next steps.",
+                steps=[
+                    LessonStep(label="Share-out", duration="5m", detail="Teams name a success and a challenge."),
+                    LessonStep(label="Restate Objective", duration="2m", detail="Teacher connects evidence back to objectives and assessment."),
+                ],
+            ),
+        ]
+        
+        extension = ExtensionTask(
+            title="Extension Challenge",
+            detail="Early finishers add a secondary feature, test it, and document trade-offs.",
+        )
+        
+        homework = HomeworkTask(
+            prompt="Reflect on collaboration, technical hurdles, and next improvements.",
+            deliverable="Short journal entry or video note highlighting one insight.",
+        )
+        
+        notes = [
+            f"Constraints to honor: {constraints}.",
+            "Adapt pacing as needed for class context.",
+        ]
+        
+        return LessonPlan(
+            meta=meta,
+            title=f"{topic} Lesson Blueprint (Variant {variant_index + 1})",
+            key_points=[
+                f"Fundamentals related to {topic}",
+                "Practical application and hands-on learning",
+                "Design process and documentation",
+                "Safety and classroom management",
+                f"Core concepts and principles of {topic}",
+            ],
+            objectives=objectives,
+            assessment=assessment,
+            sections=sections,
+            extension=extension,
+            homework=homework,
+            notes=notes,
+            materials=materials or ["General classroom supplies"],
+        )
+
+    @staticmethod
+    def _split_materials(raw: Optional[str]) -> List[str]:
+        if not raw:
+            return []
+        if isinstance(raw, list):
+            return raw
+        return [item.strip() for item in raw.split(",") if item.strip()]

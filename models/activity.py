@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 class ActivityRequest(BaseModel):
     """Request model for activity generation"""
@@ -20,5 +20,6 @@ class ActivityResponse(BaseModel):
     success: bool
     activity: Optional[str] = None  # For backward compatibility (single variant)
     activities: Optional[List[str]] = None  # For multiple variants
+    structured_activities: Optional[List[Dict[str, Any]]] = None  # TOON-based payload (plain dicts)
     error: Optional[str] = None
 

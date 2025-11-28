@@ -79,3 +79,10 @@ After restarting, test again:
 
 **Next Step**: Restart the backend server and test!
 
+---
+
+## 2025-11-27 Regression Check
+
+- Ran `python test_server.py` to ensure the FastAPI app imports and routes register after the TOON refactor.
+- Result: ✅ success, 6 routes detected, no schema warnings.
+
